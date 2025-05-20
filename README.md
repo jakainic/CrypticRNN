@@ -1,6 +1,6 @@
 # Cryptic RNN
 
-A sequence-to-sequence neural network for solving cryptic crossword clues.
+A sequence-to-sequence neural network for solving cryptic crossword clues. This will be part of a larger project with the aim of improving existing benchmarks for open-source LLM cryptic crossword solving. However, since it seems that much of the problem with LLMs solving cryptics is the mismatch between the relative coarseness of LLM tokenization and the character-level tokenization required for common types of wordplay, I was curious to start the investigation with an RNN encoder-decoder, which tokenizes at the character level.
 
 ## Project Structure
 
