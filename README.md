@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ```
 
 2. Prepare your data:
-- Place your cryptic crossword clues dataset in `clues_big.csv`
+- Place your cryptic crossword clues dataset in `clues_big.csv`. I have sourced clues from `cryptics.georgeho.org`.
 - The CSV should have columns: 'clue' and 'answer'
 
 ## Usage
