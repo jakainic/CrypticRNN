@@ -1,72 +1,85 @@
+"""
+The processor will:
+1. Load CSV with at least 'clue' and 'answer' columns
+2. Clean and normalize text (remove diacritics, keep only alphabetic)
+3. Remove rows with missing clues/answers
+4. Remove answers containing numbers
+5. Tokenize clues (word-level) and answers (character-level)
+6. Build vocabularies and create PyTorch DataLoaders
+"""
+
 from collections import Counter
+from datetime import datetime
 import logging
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Union
 
 import pandas as pd
+import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
 import unicodedata
+from sklearn.model_selection import train_test_split
 
-from config import config
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'rnn'))
+from config import config, get_device
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class Vocabulary:
-    """Custom vocabulary class to replace torchtext"""
-    def __init__(self, special_tokens: List[str]):
-        self.itos = special_tokens.copy()  # index to string
-        self.stoi: Dict[str, int] = {s: i for i, s in enumerate(special_tokens)}  # string to index
-        self.default_index = 0  # default to <pad>
+    """Manages vocabulary building and token-index mapping"""
+    def __init__(self, special_tokens: List[str] = None):
+        self.token2idx = {}
+        self.idx2token = {}
+        self.token_counts = Counter()
         
-    def build_from_tokens(self, tokens: List[List[str]], min_freq: int = 1):
-        """Build vocabulary from list of token lists"""
-        # Count token frequencies
-        counter = Counter()
-        for token_list in tokens:
-            counter.update(token_list)
-        
-        # Add tokens that meet minimum frequency
-        for token, count in counter.items():
-            if count >= min_freq and token not in self.stoi:
-                self.stoi[token] = len(self.itos)
-                self.itos.append(token)
+        if special_tokens:
+            for token in special_tokens:
+                self.add_token(token)
     
-    def __len__(self) -> int:
-        return len(self.itos)
+    def add_token(self, token: str) -> int:
+        if token not in self.token2idx:
+            idx = len(self.token2idx)
+            self.token2idx[token] = idx
+            self.idx2token[idx] = token
+        return self.token2idx[token]
+    
+    def build_from_tokens(self, tokens: List[str], min_freq: int = 1):
+        """Build vocabulary from list of token lists"""
+        # Count tokens
+        self.token_counts = Counter(tokens)
+        
+        # Add tokens that meet frequency threshold
+        for token, count in self.token_counts.items():
+            if count >= min_freq:
+                self.add_token(token)
+        
+        logger.info(f"Vocabulary size: {len(self.token2idx)}")
+        logger.info(f"Sample vocabulary: {list(self.token2idx.items())[:10]}")
     
     def encode(self, tokens: List[str]) -> List[int]:
         """Convert tokens to indices"""
-        return [self.stoi.get(token, self.default_index) for token in tokens]
+        return [self.token2idx.get(token, self.token2idx['<pad>']) for token in tokens]
     
     def decode(self, indices: List[int]) -> List[str]:
-        """Convert indices back to tokens"""
-        return [self.itos[idx] for idx in indices]
+        """Convert indices to tokens"""
+        return [self.idx2token.get(idx, '<unk>') for idx in indices]
+
+    def __len__(self):
+        return len(self.token2idx)
     
-    def set_default_index(self, index: int):
-        """Set the default index for unknown tokens"""
-        self.default_index = index
-
-class TextPreprocessor:
-    @staticmethod
-    def strip_diacritics(text: str) -> str:
-        if not isinstance(text, str):
-            return text
-        normalized = unicodedata.normalize('NFKD', text)
-        return ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
-
-    @staticmethod
-    def clean_answer(text: str) -> str:
-        if not isinstance(text, str):
-            return text
-        return ''.join(c for c in text if c.isalpha())
-
-    @staticmethod
-    def tokenize_chars(text: str) -> List[str]:
-        return list(text.lower())
+    def get_token(self, idx):
+        return self.idx2token.get(idx, '<UNK>')
+    
+    def get_idx(self, token):
+        return self.token2idx.get(token, self.token2idx.get('<UNK>', 0))
 
 class CrypticDataset(Dataset):
+    """PyTorch Dataset for cryptic clues and answers"""
     def __init__(self, clues: List[torch.Tensor], answers: List[torch.Tensor]):
         self.clues = clues
         self.answers = answers
@@ -78,55 +91,108 @@ class CrypticDataset(Dataset):
         return self.clues[idx], self.answers[idx]
 
 class DataProcessor:
+    """Handles data loading, preprocessing, and dataset creation"""
     def __init__(self, data_config=config['data']):
         self.config = data_config
-        self.preprocessor = TextPreprocessor()
         self.clue_vocab = Vocabulary(data_config.special_tokens)
         self.answer_vocab = Vocabulary(data_config.special_tokens)
+        self.device = get_device()
+        self.test_data = None  # Store test data for example generation
+        logger.info("Initialized DataProcessor")
 
-    def load_data(self) -> pd.DataFrame:
+    def load_and_clean_data(self) -> pd.DataFrame:
+        """Load and clean the raw data"""
         logger.info(f"Loading data from {self.config.data_file}")
         df = pd.read_csv(self.config.data_file, on_bad_lines='skip')
-        df = df.loc[~df.clue.isna() & ~df.answer.isna()]
+        logger.info(f"Loaded {len(df)} rows from CSV")
         
-        logger.info("Preprocessing answers...")
-        df['answer'] = df['answer'].apply(self.preprocessor.strip_diacritics)
+        # Remove rows with missing values
+        df = df.loc[~df.clue.isna() & ~df.answer.isna()]
+        logger.info(f"After removing NaN values: {len(df)} rows")
+        
+        # Clean answers
+        df['answer'] = df['answer'].apply(self.clean_text)
         num_mask = df['answer'].astype(str).str.contains(r'\d')
         df = df.loc[~num_mask]
-        df['answer'] = df['answer'].apply(self.preprocessor.clean_answer)
+        logger.info(f"After removing numeric answers: {len(df)} rows")
         
         return df
 
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Clean and normalize text"""
+        if not isinstance(text, str):
+            return text
+        # Remove diacritics
+        normalized = unicodedata.normalize('NFKD', text)
+        text = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+        # Keep only alphabetic characters
+        return ''.join(c for c in text if c.isalpha())
+
+    @staticmethod
+    def tokenize_clue(text: str) -> List[str]:
+        """Smart tokenization that preserves contractions but separates other punctuation"""
+        import re
+        
+        # Convert to lowercase first
+        text = text.lower()
+        
+        # Clean and elegant regex pattern:
+        # \w+(?:'\w+)? - matches words with optional apostrophe contractions (don't, can't, it's)
+        # [^\w\s] - matches any punctuation (non-word, non-whitespace) as separate tokens
+        tokens = re.findall(r"\w+(?:'\w+)?|[^\w\s]", text)
+        
+        return tokens
+
+    @staticmethod
+    def tokenize_answer(text: str) -> List[str]:
+        """Tokenize answer at character level"""
+        return list(text.lower())
+
     def prepare_data(self) -> Tuple[DataLoader, DataLoader]:
-        df = self.load_data()
+        """Prepare data for training and testing"""
+        logger.info("Starting data preparation...")
+        
+        # Load and clean data
+        df = self.load_and_clean_data()
         
         # Tokenize
-        clue_tokens = [self.preprocessor.tokenize_chars(clue) for clue in df['clue']]
-        answer_tokens = [self.preprocessor.tokenize_chars(ans) for ans in df['answer']]
+        logger.info("Tokenizing clues and answers...")
+        clue_tokens = [self.tokenize_clue(clue) for clue in df['clue']]
+        answer_tokens = [self.tokenize_answer(ans) for ans in df['answer']]
+        logger.info("Tokenization complete")
 
         # Build vocabularies
         logger.info("Building vocabularies...")
-        self.clue_vocab.build_from_tokens(clue_tokens)
-        self.answer_vocab.build_from_tokens(answer_tokens)
-
-        # Set default index to <pad>
-        self.clue_vocab.set_default_index(0)  # <pad> is at index 0
-        self.answer_vocab.set_default_index(0)
+        # Flatten the token lists for vocabulary building
+        flat_clue_tokens = [token for clue in clue_tokens for token in clue]
+        flat_answer_tokens = [token for answer in answer_tokens for token in answer]
+        self.clue_vocab.build_from_tokens(flat_clue_tokens)
+        self.answer_vocab.build_from_tokens(flat_answer_tokens)
+        logger.info(f"Vocabulary sizes - Clues: {len(self.clue_vocab)}, Answers: {len(self.answer_vocab)}")
+        logger.info(f"Sample clue vocabulary: {list(self.clue_vocab.token2idx.items())[:10]}")
+        logger.info(f"Sample answer vocabulary: {list(self.answer_vocab.token2idx.items())[:10]}")
 
         # Encode sequences
+        logger.info("Encoding sequences...")
         clue_ids = [self.encode_sequence(seq, self.clue_vocab) for seq in clue_tokens]
         answer_ids = [self.encode_sequence(seq, self.answer_vocab) for seq in answer_tokens]
+        logger.info("Sequence encoding complete")
 
         # Split data
+        logger.info("Splitting data into train and test sets...")
         train_inputs, test_inputs, train_targets, test_targets = train_test_split(
             clue_ids, answer_ids,
             test_size=config['training'].test_size,
             random_state=config['training'].random_seed
         )
+        logger.info(f"Split complete - Train: {len(train_inputs)} samples, Test: {len(test_inputs)} samples")
 
         # Create data loaders
+        logger.info("Creating data loaders...")
         train_loader = self.create_dataloader(train_inputs, train_targets, shuffle=True)
         test_loader = self.create_dataloader(test_inputs, test_targets, shuffle=False)
+        logger.info("Data loaders created successfully")
 
         return train_loader, test_loader
 
@@ -143,6 +209,8 @@ class DataProcessor:
         targets: List[torch.Tensor],
         shuffle: bool
     ) -> DataLoader:
+        """Create a DataLoader for the given inputs and targets"""
+        logger.info(f"Creating DataLoader with batch size {config['training'].batch_size}")
         dataset = CrypticDataset(inputs, targets)
         return DataLoader(
             dataset,
@@ -155,72 +223,58 @@ class DataProcessor:
         self,
         batch: List[Tuple[torch.Tensor, torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Collate function for DataLoader"""
         inputs, targets = zip(*batch)
         pad_idx = 0  # <pad> is at index 0
         inputs_padded = pad_sequence(inputs, batch_first=True, padding_value=pad_idx)
         targets_padded = pad_sequence(targets, batch_first=True, padding_value=pad_idx)
-        return inputs_padded, targets_padded
+        return inputs_padded.to(self.device), targets_padded.to(self.device)
 
     @property
     def vocab_sizes(self) -> Tuple[int, int]:
+        """Get the sizes of the clue and answer vocabularies"""
         return len(self.clue_vocab), len(self.answer_vocab)
 
     def decode_answer(self, tensor: torch.Tensor, skip_special_tokens: bool = True) -> str:
-        """
-        Decode a tensor of token indices back to a string.
-        Args:
-            tensor: Tensor of token indices
-            skip_special_tokens: Whether to skip special tokens (<sos>, <eos>, <pad>)
-        Returns:
-            decoded_text: The decoded string
-        """
+        """Decode a tensor of token indices back to a string"""
         if tensor.dim() == 2:
-            # If batch dimension present, take first sequence
             tensor = tensor[0]
             
         indices = tensor.cpu().tolist()
         tokens = self.answer_vocab.decode(indices)
         
         if skip_special_tokens:
-            tokens = [t for t in tokens if t not in self.config.special_tokens]
+            tokens = [t for t in tokens if t not in self.config.special_tokens and t != '<pad>']
         
         return ''.join(tokens)
 
-    def calculate_accuracy(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        return_examples: bool = False,
-        num_examples: int = 5
-    ) -> Tuple[float, List[Tuple[str, str]]]:
-        """
-        Calculate accuracy between predicted and target answers.
-        Args:
-            predictions: Tensor of predicted token indices [batch_size, seq_len]
-            targets: Tensor of target token indices [batch_size, seq_len]
-            return_examples: Whether to return example predictions
-            num_examples: Number of examples to return if return_examples is True
-        Returns:
-            accuracy: Accuracy score
-            examples: List of (predicted, target) string pairs if return_examples is True
-        """
-        correct = 0
-        total = 0
-        examples = []
-        
-        for pred, target in zip(predictions, targets):
-            pred_text = self.decode_answer(pred)
-            target_text = self.decode_answer(target)
+    def decode_clue(self, tensor: torch.Tensor, skip_special_tokens: bool = True) -> str:
+        """Decode a tensor of token indices back to a string of words"""
+        if tensor.dim() == 2:
+            tensor = tensor[0]
             
-            if pred_text == target_text:
-                correct += 1
-            total += 1
+        indices = tensor.cpu().tolist()
+        tokens = self.clue_vocab.decode(indices)
+        
+        if skip_special_tokens:
+            tokens = [t for t in tokens if t not in self.config.special_tokens and t != '<pad>']
+        
+        return ' '.join(tokens)
+
+    def get_random_test_example(self) -> Tuple[str, str]:
+        """Get a random example from the test set"""
+        if self.test_data is None:
+            # Load and clean data
+            df = self.load_and_clean_data()
             
-            if return_examples and len(examples) < num_examples:
-                examples.append((pred_text, target_text))
+            # Split into train and test
+            train_data, test_data = train_test_split(
+                df,
+                test_size=config['training'].test_size,
+                random_state=config['training'].random_seed
+            )
+            self.test_data = test_data
         
-        accuracy = correct / total if total > 0 else 0
-        
-        if return_examples:
-            return accuracy, examples
-        return accuracy, [] 
+        # Get random example
+        example = self.test_data.sample(n=1).iloc[0]
+        return example['clue'], example['answer'] 

@@ -1,87 +1,108 @@
 import logging
+from pathlib import Path
+import pandas as pd
+
+import torch
+from torch.utils.data import DataLoader, random_split
 
 from config import config
 from data_preprocessing import DataProcessor
-from models import ClueEncoder, AnswerDecoder, Clue2Ans
+from models import Clue2Ans, ClueEncoder, AnswerDecoder
 from train import Trainer
 
-# Configure logging
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('training.log')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
 logger = logging.getLogger(__name__)
 
-def setup_model(input_dim: int, output_dim: int) -> Clue2Ans:
-    """Create and initialize the model"""
+def main():
+    # Initialize data processor with robust CSV reading
+    logger.info("Initializing data processor...")
+    try:
+        # Read CSV with more robust parameters
+        data = pd.read_csv(
+            config['data'].data_file,
+            quoting=1,  # QUOTE_ALL
+            escapechar='\\',
+            on_bad_lines='warn'  # Warn about problematic lines
+        )
+        
+        # Keep only the columns we need
+        if 'clue' in data.columns and 'answer' in data.columns:
+            data = data[['clue', 'answer']]
+        else:
+            raise ValueError("CSV must contain 'clue' and 'answer' columns")
+        
+        # Remove any rows with NaN values
+        data = data.dropna()
+        
+        # Save cleaned data
+        data.to_csv('cleaned_data.csv', index=False)
+        config['data'].data_file = 'cleaned_data.csv'
+        
+    except Exception as e:
+        logger.error(f"Error reading CSV file: {str(e)}")
+        raise
+    
+    data_processor = DataProcessor()
+    
+    # Create datasets
+    logger.info("Creating data loaders...")
+    train_loader, test_loader = data_processor.prepare_data()
+    
+    # Initialize model
+    logger.info("Initializing model...")
     encoder = ClueEncoder(
-        input_dim=input_dim,
+        input_dim=len(data_processor.clue_vocab),
         emb_dim=config['model'].embedding_dim,
-        hid_dim=config['model'].hidden_dim,
-        dropout=config['model'].dropout
+        enc_hid_dim=config['model'].enc_hid_dim,
+        dec_hid_dim=config['model'].dec_hid_dim,
+        dropout=config['model'].dropout,
+        max_length=200
     )
     
     decoder = AnswerDecoder(
-        output_dim=output_dim,
+        output_dim=len(data_processor.answer_vocab),
         emb_dim=config['model'].embedding_dim,
-        hid_dim=config['model'].hidden_dim,
+        enc_hid_dim=config['model'].enc_hid_dim,
+        dec_hid_dim=config['model'].dec_hid_dim,
         dropout=config['model'].dropout
     )
     
-    return Clue2Ans(encoder, decoder, pad_idx=1)  # Assuming pad_idx=1
-
-def main():
-    """Main training script"""
-    logger.info("=" * 50)
-    logger.info("Starting Cryptic Crossword Solver Training")
-    logger.info("=" * 50)
-    logger.info(f"Device: {config['training'].device}")
-    logger.info(f"Batch size: {config['training'].batch_size}")
-    logger.info(f"Number of epochs: {config['training'].num_epochs}")
-    logger.info(f"Learning rate: {config['training'].learning_rate}")
-    logger.info("-" * 50)
+    model = Clue2Ans(
+        encoder=encoder,
+        decoder=decoder,
+        device=config['training'].device
+    )
     
-    logger.info("Initializing data processor...")
-    data_processor = DataProcessor()
+    # Model uses PyTorch default initialization
     
-    # Prepare data and get data loaders
-    train_loader, test_loader = data_processor.prepare_data()
-    
-    # Get vocabulary sizes for encoder and decoder
-    input_dim, output_dim = data_processor.vocab_sizes
-    logger.info(f"Vocabulary sizes - Input: {input_dim}, Output: {output_dim}")
-    
-    # Create model
-    logger.info("Creating model...")
-    model = setup_model(input_dim, output_dim)
-    
-    # Initialize trainer
+    # Initialize trainer with teacher forcing schedule
+    logger.info("Initializing trainer with teacher forcing schedule...")
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
-        data_processor=data_processor
+        data_processor=data_processor,
+        initial_teacher_forcing=config['model'].initial_teacher_forcing,
+        final_teacher_forcing=config['model'].final_teacher_forcing,
+        use_teacher_forcing_schedule=config['model'].use_teacher_forcing_schedule
     )
+    
+    # Create output directories
+    Path('checkpoints').mkdir(exist_ok=True)
+    Path('visualizations').mkdir(exist_ok=True)
     
     # Train model
     logger.info("Starting training...")
-    logger.info("-" * 50)
-    results = trainer.train()
-    
-    # Log final results
-    logger.info("=" * 50)
+    metrics = trainer.train()
     logger.info("Training completed!")
-    logger.info(f"Best validation loss: {results['best_val_loss']:.4f}")
-    logger.info(f"Final train accuracy: {results['train_accuracies'][-1]:.4f}")
-    logger.info(f"Final validation accuracy: {results['val_accuracies'][-1]:.4f}")
-    logger.info("=" * 50)
-    logger.info(f"Model checkpoints saved in: checkpoints/")
-    logger.info(f"Training log saved in: training.log")
+    
+    # Save final model
+    trainer.save_checkpoint('checkpoints/final_model.pt')
+    logger.info("Model saved to checkpoints/final_model.pt")
 
 def generate_answer(clue: str, model_path: str = 'checkpoints/best_model.pt'):
     """Generate an answer for a given clue using a trained model"""
@@ -97,19 +118,16 @@ def generate_answer(clue: str, model_path: str = 'checkpoints/best_model.pt'):
         data_processor
     )
     model = trainer.model
-    model.eval()
     
-    # Preprocess and encode the clue
-    preprocessor = data_processor.preprocessor
-    clue_tokens = preprocessor.tokenize_chars(clue)
-    clue_tensor = data_processor.encode_sequence(clue_tokens, data_processor.clue_vocab)
-    clue_tensor = clue_tensor.to(trainer.device)
+    # Use the improved inference function
+    from inference import generate_answer as inference_generate_answer
+    answer = inference_generate_answer(model, clue, data_processor)
     
-    # Generate answer
-    generated = model.generate(clue_tensor)
-    
-    # Decode the answer
-    answer = data_processor.decode_answer(generated)
+    # Print prediction
+    print("\nPrediction:")
+    print(f"Clue: {clue}")
+    print(f"Generated Answer: {answer}")
+    print("-" * 50)
     
     return answer
 
